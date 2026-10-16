@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+/* 다크 전용 관제 화면. 색 토큰은 컴포넌트에서 직접 지정한다. */
+html,
+body {
+  background: #090b0f;
+  color-scheme: dark;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #222834;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
