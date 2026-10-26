@@ -18,3 +18,71 @@ body {
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/*
+  지도 학교 마커 점등.
+  카카오 Marker는 이미지 기반이라 SVG 내부 애니메이션이 동작하지 않는다.
+  그래서 마커를 CustomOverlay(HTML)로 올리고 점등은 CSS로 준다.
+
+  정상은 점등하지 않는다 — 전부 깜빡이면 아무것도 눈에 안 띈다.
+  주의는 느리게(2.6s), 경고는 빠르게(1.6s) 해서 긴박도까지 구분한다.
+  prefers-reduced-motion에서는 애니메이션을 끄고 링을 고정 표시한다.
+*/
+@keyframes vaq-pulse {
+  0% {
+    transform: scale(0.55);
+    opacity: 0.55;
+  }
+  70% {
+    transform: scale(1.45);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1.45);
+    opacity: 0;
+  }
+}
+
+.vaq-pulse {
+  animation: vaq-pulse 2.6s ease-out infinite;
+}
+.vaq-pulse--critical {
+  animation-duration: 1.6s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vaq-pulse {
+    animation: none;
+    transform: scale(1);
+    opacity: 0.3;
+  }
+}
+
+/*
+  매우나쁨 점멸.
+  조리실공기질기준표가 매우나쁨 구간을 '240.0.0점멸'로 지정한다 —
+  색만 같고 점멸 유무로 나쁨/매우나쁨을 가른다. 현장 VAQ와 같은 규칙이다.
+*/
+@keyframes vaq-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0.25;
+  }
+}
+
+.vaq-blink {
+  animation: vaq-blink 1s steps(1, end) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vaq-blink {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+

@@ -40,3 +40,16 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 !.env.example
+
+# 기밀·대외 문서 (저장소가 public이다)
+#
+# 교육청 공문·기준표 원본, 특허 관련 자료는 이 저장소에 올리지 않는다.
+# 한 번 push하면 삭제해도 git 이력에 남고, public이라 누구나 과거
+# 커밋에서 되살릴 수 있다. 참고가 필요하면 저장소 밖에 두고 경로로만 쓴다.
+BBS_*.pdf
+*.pdf
+*.xlsx
+*.hwp
+*.hwpx
+/문서/
+/docs-internal/

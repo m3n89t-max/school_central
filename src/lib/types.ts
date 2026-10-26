@@ -12,7 +12,7 @@ export interface Reading {
   hcho: number; // 포름알데히드 ㎍/㎥
   temp: number; // 온도 ℃
   humidity: number; // 습도 %
-  voc: number; // VOC(휘발성유기화합물) ㎍/㎥
+  voc: number; // VOC(휘발성유기화합물) ppb — 기준표 단위. ㎍/㎥ 아님
 }
 
 export interface Zone {

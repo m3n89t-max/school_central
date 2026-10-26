@@ -1,10 +1,24 @@
 'use client';
 
 import type { School, Zone } from '@/lib/types';
-import { STATUS_COLOR, STATUS_LABEL, metricStatus } from '@/lib/thresholds';
-import type { JudgedMetric } from '@/lib/thresholds';
+import {
+  GRADE_COLOR,
+  GRADE_LABEL,
+  STATUS_COLOR,
+  STATUS_LABEL,
+  gradeBlinks,
+  metricGrade,
+  readingGrade,
+  referenceGrade,
+} from '@/lib/thresholds';
+import type { JudgedMetric, ReferenceMetric } from '@/lib/thresholds';
 
-/** 표시 순서는 실제 VAQ 측정 항목 순서를 따른다. 온도·습도는 판정하지 않고 값만 보여준다. */
+/**
+ * 표시 순서는 실제 VAQ 측정 항목 순서를 따른다.
+ * 온도·습도는 기준표에 없다 — 참고 색만 입히고 '참고'로 표시하며
+ * 학교 상태(정상/주의/경고) 판정에는 쓰지 않는다.
+ * 단위는 조리실공기질기준표 기준 — VOC는 ppb다(㎍/㎥ 아님).
+ */
 const METRICS = [
   { key: 'pm25', label: '초미세먼지', unit: '㎍/㎥', judged: true },
   { key: 'pm10', label: '미세먼지', unit: '㎍/㎥', judged: true },
@@ -12,32 +26,56 @@ const METRICS = [
   { key: 'co', label: '일산화탄소', unit: 'ppm', judged: true, decimals: 1 },
   { key: 'hcho', label: '포름알데히드', unit: '㎍/㎥', judged: true },
   { key: 'temp', label: '온도', unit: '℃', judged: false, decimals: 1 },
-  { key: 'humidity', label: '습도', unit: '%', judged: false },
-  { key: 'voc', label: 'VOC', unit: '㎍/㎥', judged: true },
+  { key: 'humidity', label: '습도', unit: '%RH', judged: false },
+  { key: 'voc', label: 'VOC', unit: 'ppb', judged: true },
 ] as const;
 
 function ZoneCard({ zone }: { zone: Zone }) {
+  // 구역 종합 등급은 기준표 5단계로 보여준다. 지도 3단계는 축약본이다.
+  const zoneGrade = readingGrade(zone.reading);
   return (
     <div className="rounded-xl border border-[#1B2029] bg-[#0F131A] p-3">
       <div className="mb-2.5 flex items-center justify-between">
         <span className="flex items-center gap-2 text-[13px] font-medium text-[#E6E8EB]">
-          <i className="h-2 w-2 rounded-full" style={{ background: STATUS_COLOR[zone.status] }} />
+          <i
+            className={`h-2 w-2 rounded-full${gradeBlinks(zoneGrade) ? ' vaq-blink' : ''}`}
+            style={{ background: GRADE_COLOR[zoneGrade] }}
+          />
           {zone.kind}
         </span>
-        <span className="text-[11px] font-medium" style={{ color: STATUS_COLOR[zone.status] }}>
-          {STATUS_LABEL[zone.status]}
+        <span className="flex items-center gap-1.5 text-[11px] font-medium">
+          <span style={{ color: GRADE_COLOR[zoneGrade] }}>{GRADE_LABEL[zoneGrade]}</span>
+          <span className="text-[#4E5765]">·</span>
+          <span style={{ color: STATUS_COLOR[zone.status] }}>{STATUS_LABEL[zone.status]}</span>
         </span>
       </div>
       <dl className="space-y-1">
         {METRICS.map((m) => {
           const value = zone.reading[m.key];
-          const color = m.judged
-            ? STATUS_COLOR[metricStatus(m.key as JudgedMetric, value)]
-            : '#C9CFD8';
+          // 판정 대상은 기준표 등급, 온습도는 참고 등급. 둘을 섞어 쓰지 않는다.
+          const grade = m.judged
+            ? metricGrade(m.key as JudgedMetric, value)
+            : referenceGrade(m.key as ReferenceMetric, value);
+          const color = GRADE_COLOR[grade];
           return (
             <div key={m.key} className="flex items-baseline justify-between">
-              <dt className="text-[12px] text-[#79828F]">{m.label}</dt>
-              <dd className="font-mono text-[13px]" style={{ color }}>
+              <dt className="text-[12px] text-[#79828F]">
+                {m.label}
+                {grade !== 'veryGood' && (
+                  <span className="ml-1.5 text-[10px]" style={{ color }}>
+                    {GRADE_LABEL[grade]}
+                  </span>
+                )}
+                {!m.judged && (
+                  <span className="ml-1 text-[9px] text-[#F5A623]">참고</span>
+                )}
+              </dt>
+              <dd
+                className={`font-mono text-[13px]${
+                  m.judged && gradeBlinks(grade) ? ' vaq-blink' : ''
+                }`}
+                style={{ color }}
+              >
                 {'decimals' in m ? value.toFixed(m.decimals) : value}
                 <span className="ml-1 text-[10px] text-[#5F6875]">{m.unit}</span>
               </dd>

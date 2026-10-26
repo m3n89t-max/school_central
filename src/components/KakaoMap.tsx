@@ -1,18 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { School, Status } from '@/lib/types';
+import type { School } from '@/lib/types';
 import { STATUS_COLOR, STATUS_LABEL } from '@/lib/thresholds';
 import geo from '@/data/jeju-geo.json';
 import {
   GRADE_COLOR,
-  GRADE_OPACITY,
   REGIONS,
   pm10Grade,
   type OutdoorReading,
   type RegionId,
 } from '@/lib/outdoor';
-import { regionPolygons } from '@/lib/regionGeometry';
 
 /**
  * 카카오맵 버전. 벡터맵과 비교용이다.
@@ -37,22 +35,27 @@ declare global {
 }
 
 const SDK_ID = 'kakao-maps-sdk';
-/** 타일에만 거는 다크 보정. 오버레이에는 적용되지 않으므로 채도를 과감히 낮출 수 있다. */
-const TILE_FILTER = 'invert(1) hue-rotate(180deg) brightness(0.82) contrast(1.05) saturate(0.18)';
+/**
+ * 이 레벨보다 축소하면 마커를 묶는다. 100개교 규모 대비.
+ *
+ * 제주 전도가 들어오는 초기 레벨이 10이라, 기준을 그보다 낮게 잡으면
+ * 첫 화면에서 학교가 한 곳도 안 보이고 클러스터 원만 뜬다.
+ * 전도에서도 개별 학교 상태가 보여야 관제 화면이므로 11로 둔다.
+ */
+const CLUSTER_MIN_LEVEL = 11;
 
-/** 타일 img를 가장 많이 담고 있는 레이어를 찾아 필터를 건다. */
-function paintTiles(container: HTMLElement, on: boolean) {
-  const layers = Array.from(container.querySelectorAll('div')).filter(
-    (d) => d.querySelectorAll(':scope > img').length >= 4,
-  );
-  if (!layers.length) return;
-  layers.sort(
-    (a, b) => b.querySelectorAll(':scope > img').length - a.querySelectorAll(':scope > img').length,
-  );
-  layers[0].style.filter = on ? TILE_FILTER : '';
-}
-/** 이 레벨보다 축소하면 마커를 묶는다. 100개교 규모 대비. */
-const CLUSTER_MIN_LEVEL = 7;
+/** 클러스터 판정용 자리표시자 마커 이미지. 1x1 투명 GIF — 화면에는 보이지 않는다. */
+const BLANK_PIN =
+  'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+/**
+ * 지도 마커용 학교 건물 이미지.
+ *
+ * 대표님이 주신 school-miniature-v2.svg(1536x1024 PNG를 SVG로 감싼 2.3MB 파일)에서
+ * 검정 배경과 초록 글로우를 제거하고 256px로 줄인 것이다. 원본을 그대로 쓰면
+ * 지도에 검은 사각형이 생기고 용량도 마커 하나당 2.3MB가 된다.
+ */
+const SCHOOL_ICON = '/school.png';
 
 function loadSdk(appkey: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -77,20 +80,249 @@ function loadSdk(appkey: string): Promise<void> {
   });
 }
 
-/** 상태별 마커. 벡터맵과 같은 규칙 — 색만으로 구분하지 않고 모양도 다르게 한다. */
-function markerSvg(status: Status): string {
-  const c = STATUS_COLOR[status];
-  const shape =
-    status === 'normal'
-      ? `<circle cx="9" cy="9" r="6" fill="${c}" stroke="#0B0E13" stroke-width="2"/>`
-      : status === 'warning'
-        ? `<polygon points="9,2 16,15.5 2,15.5" fill="${c}" stroke="#0B0E13" stroke-width="2" stroke-linejoin="round"/>`
-        : `<rect x="3" y="3" width="12" height="12" rx="1" fill="${c}" stroke="#0B0E13" stroke-width="2"/>`;
-  return `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18">${shape}</svg>`)}`;
+/**
+ * 학교 마커 HTML.
+ *
+ * 아이콘은 학교 건물 하나로 통일하고, 상태는 세 겹으로 전달한다.
+ *   1) 아이콘 색  — 정상 초록 / 주의 노랑 / 경고 빨강
+ *   2) 모서리 배지 — 원·삼각·사각. 색만으로 구분되지 않게 하는 보조 부호(적색약 대응)
+ *   3) 점등        — 주의·경고만. 경고가 더 빠르다
+ *
+ * 카카오 Marker(이미지)로는 1)·2)까지만 되고 3)이 안 된다.
+ * 그래서 CustomOverlay로 HTML을 올리고 점등은 CSS 애니메이션에 맡긴다.
+ */
+/**
+ * 지도 레벨 → 마커 배율.
+ *
+ * 카카오 레벨은 숫자가 클수록 멀리 본다. 제주 전체는 8~9, 한 학교로
+ * 확대하면 3이다. 멀리 볼수록 아이콘을 작게 해야 섬 모양이 보인다.
+ *
+ * 레벨 1단계는 축척 2배라 배율도 그에 맞춰 벌리면 전체 지도에서
+ * 아이콘이 점이 된다. 그래서 선형으로 완만하게 깎는다.
+ *   레벨 3(학교 확대) → 1.30
+ *   레벨 6            → 1.00
+ *   레벨 8(제주 전체) → 0.80
+ *   레벨 9 이상       → 0.70 (하한)
+ * 하한을 두는 이유는 50인치 TV에서 수 미터 떨어져 보기 때문이다.
+ * 작아도 건물 형태와 상태색은 분간돼야 한다.
+ */
+function markerScale(level: number | null): number {
+  if (level == null) return 1;
+  return Math.max(0.7, Math.min(1.3, 1 + (6 - level) * 0.1));
 }
 
-/** 권역 폴리곤은 좌표가 고정이므로 한 번만 계산한다. */
-const REGION_SHAPES = regionPolygons();
+function markerHtml(s: School, selected: boolean, scale = 1): string {
+  const c = STATUS_COLOR[s.status];
+  /*
+    마커 크기 — 2026-10-26 대표님 지시로 지도 축척에 비례시킨다.
+    "초기 전체지도 볼때 지도가 작고 학교아이콘이 너무 커 비율 맞춰줘"
+
+    전에는 64px 고정이었다. 제주 전체(레벨 8~9)에서는 섬 폭이 화면의
+    절반 남짓인데 건물이 64px이라, 12개가 몰린 제주시 북부가 아이콘
+    덩어리로 뭉개졌다. 반대로 한 학교로 확대(레벨 3)하면 지도는 꽉
+    찼는데 같은 64px이라 상대적으로 작아 보였다.
+
+    scale은 호출부가 현재 지도 레벨에서 구해 넘긴다. 전체 지도에서는
+    작게, 확대할수록 커진다. 축척이 바뀌면 아이콘도 같이 바뀌어야
+    "지도 위의 건물"로 읽힌다.
+  */
+  const size = Math.round((selected ? 56 : 44) * scale);
+  const pulse = s.status !== 'normal';
+
+  // 상태 배지. 벡터맵과 같은 규칙 — 정상 원 / 주의 삼각 / 경고 사각.
+  const badge =
+    s.status === 'normal'
+      ? `<circle cx="5" cy="5" r="3.4" fill="${c}" stroke="#0B0E13" stroke-width="1.6"/>`
+      : s.status === 'warning'
+        ? `<polygon points="5,1.2 9,8.2 1,8.2" fill="${c}" stroke="#0B0E13" stroke-width="1.6" stroke-linejoin="round"/>`
+        : `<rect x="1.4" y="1.4" width="7.2" height="7.2" rx="0.8" fill="${c}" stroke="#0B0E13" stroke-width="1.6"/>`;
+
+  // 입체 학교 건물 이미지(대표님 제공 school-miniature-v2.svg에서 배경을 제거한 PNG).
+  //
+  // 원본은 초록 한 가지 색이라 그대로 쓰면 주의·경고를 색으로 구분할 수 없다.
+  // 그래서 CSS hue-rotate로 색조를 돌린다. 원본 벽면 색조가 94도이므로
+  // 노랑(48도)까지 -46도, 빨강(5도)까지 -89도가 필요하다 — 측정해서 구한 값이다.
+  //
+  // 지붕이 어두워 작은 크기에서 전체가 탁해 보인다. 주의·경고는 대비를 올려
+  // 벽면 색이 앞으로 나오게 한다.
+  const tint =
+    s.status === 'normal'
+      ? 'saturate(1.2) brightness(1.05)'
+      : s.status === 'warning'
+        ? 'hue-rotate(-46deg) saturate(2.2) brightness(1.3) contrast(1.12)'
+        : 'hue-rotate(-89deg) saturate(2.8) brightness(1.22) contrast(1.15)';
+
+  // 건물 비율이 가로로 넓다(256x186). 세로를 기준으로 맞추면 너무 커지므로
+  // 가로를 size에 맞추고 세로는 비율대로 둔다.
+  const iw = Math.round(size * 1.34);
+  const ih = Math.round(iw * (186 / 256));
+  // Tailwind preflight의 `img{max-width:100%}`가 부모 폭에 맞춰 이미지를 줄여버린다.
+  // 컨테이너를 건물 폭으로 잡고 max-width도 명시해 무력화한다.
+  const school = `<img src="${SCHOOL_ICON}" alt="" width="${iw}" height="${ih}"
+      style="display:block;width:${iw}px;height:${ih}px;max-width:none;
+             filter:${tint} drop-shadow(0 2px 3px rgba(0,0,0,.95));
+             image-rendering:-webkit-optimize-contrast;pointer-events:none">`;
+
+  // 점등 링은 건물 중심(세로 절반)에 맞춘다. 건물이 가로로 넓어 지름도 가로 기준.
+  const cy = ih / 2;
+  const ringD = iw * 1.5;
+  const ring = pulse
+    ? `<span class="vaq-pulse${s.status === 'critical' ? ' vaq-pulse--critical' : ''}"
+         style="position:absolute;left:50%;top:${cy}px;width:${ringD}px;height:${ringD}px;
+                margin-left:${-ringD / 2}px;margin-top:${-ringD / 2}px;
+                border-radius:50%;background:${c};pointer-events:none"></span>`
+    : '';
+
+  // 상태를 건물 색에만 기대지 않도록 바닥에 색 받침을 깐다.
+  // 지붕이 어두워 작은 크기에서 건물 색만으로는 멀리서 읽히지 않는다.
+  const padW = iw * 0.82;
+  const plate = `<span style="position:absolute;left:50%;top:${ih - 3}px;
+       width:${padW}px;height:${padW * 0.3}px;margin-left:${-padW / 2}px;
+       border-radius:50%;background:${c};opacity:${s.status === 'normal' ? 0.5 : 0.75};
+       filter:blur(${iw * 0.045}px);pointer-events:none"></span>`;
+
+  const halo = selected
+    ? `<span style="position:absolute;left:50%;top:${cy}px;width:${iw * 1.22}px;height:${iw * 1.22}px;
+         margin-left:${(-iw * 1.22) / 2}px;margin-top:${(-iw * 1.22) / 2}px;
+         border-radius:50%;border:2px solid ${c};opacity:.9;pointer-events:none"></span>`
+    : '';
+
+  // 학교명은 아이콘 **하단**에 항상 띄운다(2026-10-16 대표님 지시).
+  // 글자도 마커와 같은 비율로 움직인다. 아이콘만 줄이고 글자를 두면
+  // 이름표가 건물보다 커져 지도가 글자밭이 된다.
+  const fs = Math.max(11, Math.round((selected ? 19 : 16) * scale));
+  const label = `<span data-vaq-label="1" data-vaq-pri="${selected ? 3 : s.status === 'critical' ? 2 : s.status === 'warning' ? 1 : 0}"
+       style="position:absolute;left:50%;top:${ih + 4}px;transform:translateX(-50%);
+       white-space:nowrap;font-size:${fs}px;font-weight:${selected ? 800 : 700};
+       color:${selected ? '#FFFFFF' : '#F2F4F7'};letter-spacing:-0.2px;
+       padding:2px 7px;border-radius:5px;
+       background:rgba(11,14,19,.78);border:1px solid ${c}66;
+       text-shadow:0 1px 2px #0B0E13;
+       pointer-events:none">${s.name}</span>`;
+
+  return `<div title="${s.name} · ${STATUS_LABEL[s.status]}"
+      style="position:relative;width:${iw}px;height:${ih}px;cursor:pointer">
+    ${ring}${plate}${halo}
+    <span style="position:relative;display:block">${school}</span>
+    <span style="position:absolute;right:${-size * 0.16}px;bottom:${-size * 0.04}px;pointer-events:none">
+      <svg width="18" height="18" viewBox="0 0 10 10">${badge}</svg>
+    </span>
+    ${label}
+  </div>`;
+}
+
+
+/**
+ * 본섬이 화면을 꽉 채우도록 지도 범위를 맞춘다.
+ *
+ * setBounds만 쓰면 카카오가 정수 레벨로 **올림**해 한 단계 더 멀어진다.
+ * 그 결과 50인치 화면에서 섬이 가운데 작게 박히고 바다가 넓게 남는다.
+ * 그래서 맞춘 뒤 실제 채움 비율을 재서, 한 단계 당겨도 섬이 잘리지
+ * 않으면 당긴다. 화면 비율(가로로 긴 TV)에 따라 결과가 달라지므로
+ * 상수로 박지 않고 그때그때 계산한다.
+ */
+function fitIsland(kakao: typeof window.kakao, map: any): void {
+  const [minLng, minLat, maxLng, maxLat] = geo.islandBbox as number[];
+  const sw = new kakao.maps.LatLng(minLat, minLng);
+  const ne = new kakao.maps.LatLng(maxLat, maxLng);
+  const b = new kakao.maps.LatLngBounds();
+  b.extend(sw);
+  b.extend(ne);
+  map.setBounds(b);
+
+  // 한 단계 당겼을 때 섬이 화면 안에 그대로 들어오는지 확인한 뒤에만 적용한다.
+  const lv = map.getLevel();
+  if (lv <= 1) return;
+  map.setLevel(lv - 1);
+  const v = map.getBounds();
+  const vs = v.getSouthWest();
+  const vn = v.getNorthEast();
+  const fits =
+    vs.getLat() <= minLat && vs.getLng() <= minLng && vn.getLat() >= maxLat && vn.getLng() >= maxLng;
+  if (!fits) map.setLevel(lv);
+  map.setCenter(new kakao.maps.LatLng((minLat + maxLat) / 2, (minLng + maxLng) / 2));
+}
+
+/**
+ * 겹치는 학교명 라벨을 솎아낸다.
+ *
+ * 2026-10-23 대표님 지시로 글자를 17px까지 키우자 제주시 북부에서
+ * 20쌍이 겹치고 최대 88%가 가려졌다("라중학교", "홀초등학교"처럼 잘려 읽힘).
+ * 글자를 키운 효과가 겹침으로 상쇄된 셈이다.
+ *
+ * 글자를 다시 줄이는 대신, 겹치는 것만 숨긴다. 50인치에서 읽히는 크기를
+ * 지키는 쪽이 우선이고, 가려진 학교는 어차피 못 읽던 것이다.
+ *
+ * 남길 우선순위는 경고 > 주의 > 정상, 선택된 학교는 항상 남긴다.
+ * 관제 화면에서 이름이 꼭 필요한 건 문제가 난 학교다. 정상 학교는
+ * 이름이 숨어도 건물 색과 받침으로 정상임이 전달된다.
+ *
+ * 숨겨도 아이콘·색·배지는 그대로 남으므로 "학교가 사라진" 것처럼 보이지 않는다.
+ */
+function hideCollidingLabels(map: any): void {
+  void map;
+  const els = Array.from(
+    document.querySelectorAll<HTMLElement>('[data-vaq-label="1"]'),
+  );
+  if (els.length === 0) return;
+
+  // 먼저 전부 되살린다. 지도를 움직이면 겹침 관계가 완전히 바뀌므로
+  // 이전 판정을 남겨두면 한 번 숨은 라벨이 영영 돌아오지 않는다.
+  els.forEach((e) => {
+    e.style.visibility = 'visible';
+    e.style.marginTop = '0px';
+  });
+
+  // 우선순위가 높은 것부터 자리를 차지한다.
+  const items = els
+    .map((el) => ({ el, pri: Number(el.dataset.vaqPri ?? 0), r: el.getBoundingClientRect() }))
+    .filter((it) => it.r.width > 0)
+    .sort((a, b) => b.pri - a.pri);
+
+  const kept: DOMRect[] = [];
+  for (const it of items) {
+    const collides = (r: { left: number; right: number; top: number; bottom: number }) =>
+      kept.some(
+        (k) => r.left < k.right + 2 && r.right + 2 > k.left && r.top < k.bottom + 2 && r.bottom + 2 > k.top,
+      );
+
+    if (!collides(it.r)) {
+      kept.push(it.r);
+      continue;
+    }
+
+    /*
+      경보·주의 학교(pri>=1)는 쉽게 포기하지 않는다.
+      관제 화면에서 이름이 꼭 필요한 것이 바로 문제가 난 학교인데,
+      먼저 자리를 잡은 이웃(심지어 같은 등급)에 막혀 숨으면 본말이 뒤집힌다.
+      실제로 탐라중학교(경보)가 광령초등학교에 막혀 숨고, 정상 학교 4곳은
+      이름이 보이는 상태가 나왔다.
+
+      그래서 아래로 한 칸씩 내려 빈자리를 찾는다. 위가 아니라 아래로 내리는
+      이유는 라벨이 건물 아래에 붙어 있어, 위로 올리면 건물 그림을 가리기
+      때문이다. 세 칸까지만 시도하고 그래도 자리가 없으면 숨긴다 —
+      더 멀리 보내면 어느 건물의 이름인지 알 수 없다.
+    */
+    let placed = false;
+    if (it.pri >= 1) {
+      const step = it.r.height + 3;
+      for (let k = 1; k <= 3 && !placed; k++) {
+        const moved = {
+          left: it.r.left,
+          right: it.r.right,
+          top: it.r.top + step * k,
+          bottom: it.r.bottom + step * k,
+        };
+        if (!collides(moved)) {
+          it.el.style.marginTop = `${step * k}px`;
+          kept.push(moved as DOMRect);
+          placed = true;
+        }
+      }
+    }
+    if (!placed) it.el.style.visibility = 'hidden';
+  }
+}
 
 /** 권역 칩 HTML. 벡터맵 칩과 같은 정보를 같은 순서로 보여준다. */
 function chipHtml(name: string, o: OutdoorReading, grade: string, color: string): string {
@@ -113,27 +345,40 @@ interface Props {
   schools: School[];
   selectedId: string | null;
   onSelect: (id: string) => void;
-  dark: boolean;
   outdoor: Record<RegionId, OutdoorReading> | null;
+  /**
+   * 오토파일럿이 비추는 학교. 값이 오면 그 학교로 확대하고,
+   * null이 되면 제주 전체로 돌아간다. 사람이 고른 selectedId와는 별개다.
+   */
+  focusId?: string | null;
+  /** 확대 시 쓸 지도 레벨. 작을수록 가깝다. */
+  focusLevel?: number;
 }
 
-export default function KakaoMap({ schools, selectedId, onSelect, dark, outdoor }: Props) {
+export default function KakaoMap({
+  schools,
+  selectedId,
+  onSelect,
+  outdoor,
+  focusId = null,
+  focusLevel = 5,
+}: Props) {
   const boxRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
   const clustererRef = useRef<any>(null);
   const regionRef = useRef<any[]>([]);
+  /** 학교 마커 CustomOverlay. 클러스터러가 관리하지 않으므로 직접 치운다. */
+  const overlayRef = useRef<any[]>([]);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [level, setLevel] = useState<number | null>(null);
 
   const appkey = process.env.NEXT_PUBLIC_KAKAO_MAP_API_KEY;
   const select = useCallback((id: string) => onSelect(id), [onSelect]);
-  const darkRef = useRef(dark);
-  darkRef.current = dark;
-
   useEffect(() => {
     if (!appkey) {
-      setError('NEXT_PUBLIC_KAKAO_MAP_API_KEY가 비어 있습니다.');
+      // 이펙트 본문에서 동기 setState를 하면 연쇄 렌더가 난다(react-hooks/set-state-in-effect).
+      queueMicrotask(() => setError('NEXT_PUBLIC_KAKAO_MAP_API_KEY가 비어 있습니다.'));
       return;
     }
     let cancelled = false;
@@ -141,15 +386,18 @@ export default function KakaoMap({ schools, selectedId, onSelect, dark, outdoor 
       .then(() => {
         if (cancelled || !boxRef.current || mapRef.current) return;
         const { kakao } = window;
-        const [minLng, minLat, maxLng, maxLat] = geo.mainBbox as number[];
+        /*
+          초기 범위는 본섬만 쓴다(2026-10-23 대표님 지시: "마라도 추자도는 빼").
+          mainBbox는 마라도(위도 33.158)·추자도 일부를 포함해 섬이 화면
+          가운데 작게 박히고 바다 여백이 과도했다. 설치 학교 12곳은 모두
+          본섬 안에 있으므로 islandBbox로 꽉 채운다.
+        */
+        const [minLng, minLat, maxLng, maxLat] = geo.islandBbox as number[];
         const map = new kakao.maps.Map(boxRef.current, {
           center: new kakao.maps.LatLng((minLat + maxLat) / 2, (minLng + maxLng) / 2),
           level: 10,
         });
-        const b = new kakao.maps.LatLngBounds();
-        b.extend(new kakao.maps.LatLng(minLat, minLng));
-        b.extend(new kakao.maps.LatLng(maxLat, maxLng));
-        map.setBounds(b);
+        fitIsland(kakao, map);
 
         clustererRef.current = new kakao.maps.MarkerClusterer({
           map,
@@ -176,10 +424,6 @@ export default function KakaoMap({ schools, selectedId, onSelect, dark, outdoor 
         mapRef.current = map;
         setLevel(map.getLevel());
         kakao.maps.event.addListener(map, 'zoom_changed', () => setLevel(map.getLevel()));
-        // 타일 레이어는 줌·패닝으로 다시 만들어질 수 있어 그때마다 다시 칠한다.
-        kakao.maps.event.addListener(map, 'tilesloaded', () => {
-          if (boxRef.current) paintTiles(boxRef.current, darkRef.current);
-        });
         setReady(true);
       })
       .catch((e: Error) => !cancelled && setError(e.message));
@@ -188,9 +432,36 @@ export default function KakaoMap({ schools, selectedId, onSelect, dark, outdoor 
     };
   }, [appkey]);
 
+  /**
+   * 오토파일럿 카메라 — 비출 학교로 확대하고, 풀리면 제주 전체로 돌아간다.
+   *
+   * panTo를 쓰는 이유: setCenter는 화면이 툭 끊겨 바뀐다. 멀리서 간헐적으로
+   * 보는 화면에서는 '지도가 미끄러져 이동했다'는 과정이 보여야 관제자가
+   * 어디에서 어디로 갔는지 따라갈 수 있다.
+   *
+   * 레벨을 먼저 맞추고 중심을 옮기는 순서다. 반대로 하면 축소 상태에서
+   * 패닝한 뒤 확대돼 두 번 움직이는 것처럼 보인다.
+   */
   useEffect(() => {
-    if (boxRef.current && ready) paintTiles(boxRef.current, dark);
-  }, [dark, ready]);
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const { kakao } = window;
+
+    if (focusId) {
+      const s = schools.find((x) => x.id === focusId);
+      if (!s) return;
+      map.setLevel(focusLevel, { animate: true });
+      map.panTo(new kakao.maps.LatLng(s.lat, s.lng));
+      return;
+    }
+
+    // 전체 복귀. 초기 진입과 같은 범위를 쓴다(본섬 기준, 꽉 채움).
+    fitIsland(kakao, map);
+    // schools를 의존성에 넣지 않는다. 측정값이 5초마다 바뀌며 배열이 새로
+    // 만들어지는데, 그때마다 카메라를 다시 움직이면 지도가 계속 들썩인다.
+    // 좌표는 고정이므로 focusId가 바뀔 때만 움직이면 충분하다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusId, focusLevel, ready]);
 
   // 실외 4권역: 섬을 부채꼴로 자른 폴리곤 + 권역당 칩 하나.
   useEffect(() => {
@@ -204,20 +475,18 @@ export default function KakaoMap({ schools, selectedId, onSelect, dark, outdoor 
     for (const r of REGIONS) {
       const o = outdoor[r.id];
       const g = pm10Grade(o.pm10);
-      for (const ring of REGION_SHAPES[r.id]) {
-        const poly = new kakao.maps.Polygon({
-          path: ring.map((p) => new kakao.maps.LatLng(p.lat, p.lng)),
-          fillColor: GRADE_COLOR[g],
-          // 다크 타일 위에서는 조금 진해야 보이고, 원래(밝은) 지도에서는 그대로가 적당하다.
-          fillOpacity: GRADE_OPACITY[g] * (darkRef.current ? 1.35 : 1),
-          strokeWeight: 1,
-          strokeColor: GRADE_COLOR[g],
-          strokeOpacity: 0.35,
-          zIndex: 1,
-        });
-        poly.setMap(map);
-        regionRef.current.push(poly);
-      }
+
+      // 권역 배경 틴트는 걷어냈다(2026-10-23 대표님 지적).
+      //
+      // 섬 전체를 등급 색으로 덮으니 카카오맵 본래 색이 보라로 덧씌워져
+      // 지명·도로가 묻혔다. 경계선을 지웠어도 '틴트의 경계'가 그대로 남아
+      // 부채꼴 분할선이 실제 행정 경계처럼 읽히는 문제도 되살아났다.
+      // 4분할은 한라산 방위각 **근사**일 뿐이라 그렇게 보이면 안 된다.
+      //
+      // 실외 등급은 권역 칩(색 점 + 등급 글자 + 실측 수치)으로만 전달한다.
+      // 실내·실외 비교 판정은 lib/outdoorCompare.ts가 따로 맡는다.
+      // 틴트를 되살리고 싶으면 칩이 못 주는 것이 무엇인지부터 답할 것.
+
       const chip = new kakao.maps.CustomOverlay({
         position: new kakao.maps.LatLng(r.chip.lat, r.chip.lng),
         content: chipHtml(r.name, o, g, GRADE_COLOR[g]),
@@ -226,7 +495,7 @@ export default function KakaoMap({ schools, selectedId, onSelect, dark, outdoor 
       chip.setMap(map);
       regionRef.current.push(chip);
     }
-  }, [outdoor, ready, dark]);
+  }, [outdoor, ready]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -234,21 +503,81 @@ export default function KakaoMap({ schools, selectedId, onSelect, dark, outdoor 
     if (!map || !clusterer) return;
     const { kakao } = window;
     clusterer.clear();
+
+    // CustomOverlay는 Marker가 아니라 클러스터러가 받지 않는다.
+    // 그래서 위치 계산용 투명 Marker를 클러스터러에 넣고(= 묶임 판정은 그대로),
+    // 실제로 보이는 것은 같은 좌표의 CustomOverlay가 맡는다.
+    //
+    // 묶인 구간에서는 오버레이를 숨겨 클러스터 원만 남긴다.
+    // 이 판정을 별도 이펙트로 두면 안 된다 — schools는 5초마다 새 배열이라
+    // 이 이펙트가 재실행되는데, level이 안 변하면 숨김 이펙트는 다시 돌지 않아
+    // 오버레이가 사라진 채로 남는다. 그래서 여기서 한 번에 처리한다.
+    const clustered = level !== null && level >= CLUSTER_MIN_LEVEL;
+    // 현재 축척에 맞는 마커 배율. 전체 지도에서는 작게, 확대하면 크게.
+    const scale = markerScale(level);
+
     const markers = schools.map((s) => {
-      const size = s.id === selectedId ? 26 : 18;
-      const image = new kakao.maps.MarkerImage(markerSvg(s.status), new kakao.maps.Size(size, size), {
-        offset: new kakao.maps.Point(size / 2, size / 2),
+      const pos = new kakao.maps.LatLng(s.lat, s.lng);
+      const selected = s.id === selectedId;
+
+      // content로 문자열을 넘기면 getContent()가 문자열을 돌려줘 리스너를 걸 수 없다.
+      // 엘리먼트를 직접 만들어 넘기고, 그 엘리먼트에 클릭을 건다.
+      const el = document.createElement('div');
+      el.innerHTML = markerHtml(s, selected, scale);
+
+      const overlay = new kakao.maps.CustomOverlay({
+        position: pos,
+        content: el,
+        // 겹칠 때 무엇이 위로 오는지 정한다.
+        //
+        // 1순위는 선택, 그다음 경고 > 주의 > 정상. 여기까진 기존과 같다.
+        // 같은 등급끼리 겹치면(제주시 북부에 12쌍, 최대 89% 가림) 층이 같아
+        // 그리는 순서대로 가려졌다. 남쪽 학교를 위에 둬 건물이 앞뒤로 서게 한다
+        // — 화면 아래 = 앞이라는 통념과 맞고, 위도는 학교마다 달라 안정적이다.
+        //
+        // 제주 위도 범위(33.2~33.6)를 0~999로 펴 등급 간 간격(1000)을 넘지 않게 한다.
+        zIndex:
+          (selected ? 6 : s.status === 'critical' ? 5 : s.status === 'warning' ? 4 : 3) * 1000 +
+          Math.max(0, Math.min(999, Math.round((33.6 - s.lat) * 2500))),
       });
-      const marker = new kakao.maps.Marker({
-        position: new kakao.maps.LatLng(s.lat, s.lng),
-        image,
-        title: `${s.name} · ${STATUS_LABEL[s.status]}`,
+      if (!clustered) overlay.setMap(map);
+      overlayRef.current.push(overlay);
+
+      el.addEventListener('click', (ev: MouseEvent) => {
+        ev.stopPropagation();
+        select(s.id);
       });
-      kakao.maps.event.addListener(marker, 'click', () => select(s.id));
-      return marker;
+
+      // 클러스터 판정용 자리표시자. 보이지 않아야 하므로 1x1 투명 이미지를 쓴다.
+      return new kakao.maps.Marker({
+        position: pos,
+        image: new kakao.maps.MarkerImage(BLANK_PIN, new kakao.maps.Size(1, 1)),
+        clickable: false,
+      });
     });
     clusterer.addMarkers(markers);
-  }, [schools, selectedId, select, ready]);
+    // 오버레이 DOM이 붙은 뒤에 재야 한다. 같은 틱에 재면 폭이 0으로 나온다.
+    const raf = requestAnimationFrame(() => hideCollidingLabels(map));
+
+    return () => {
+      cancelAnimationFrame(raf);
+      overlayRef.current.forEach((o) => o.setMap(null));
+      overlayRef.current = [];
+    };
+  }, [schools, selectedId, select, ready, level]);
+
+  /*
+    지도를 움직이면 라벨 간격이 바뀌므로 다시 솎아낸다.
+    idle은 패닝·줌이 끝난 시점에 한 번만 오므로 드래그 중 매 프레임 계산하지 않는다.
+  */
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !ready) return;
+    const { kakao } = window;
+    const h = () => hideCollidingLabels(map);
+    kakao.maps.event.addListener(map, 'idle', h);
+    return () => kakao.maps.event.removeListener(map, 'idle', h);
+  }, [ready]);
 
   return (
     <div className="relative h-full w-full bg-[#090B0F]">
